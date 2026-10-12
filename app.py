@@ -398,7 +398,12 @@ async def search_knowledge(query: str, top_k: int = None) -> list:
     if not RAG_ENABLED:
         return []
     try:
-        top_k = top_k or RAG_TOP_K
+        try:
+            top_k = int(top_k or RAG_TOP_K or 5)
+        except Exception:
+            top_k = 5
+        if top_k <= 0:
+            top_k = 5
         q_vec = (await embed_texts([query]))[0]
         # pgvector 余弦相似度检索
         from sqlalchemy import text
@@ -1229,17 +1234,34 @@ def me(request: Request):
     return {"user_id": user_id, "username": username, "phone": row.phone if row else None, "is_admin": username == ADMIN_USERNAME}
 
 @app.get("/api/ping")
-def api_ping():
-    """★ 保活探针（公开、无鉴权）：真读一次数据库，防止 Supabase 免费版因长时间无活动被暂停。
+async def api_ping():
+    """★ 保活探针 + 自检（公开、无鉴权）：真读一次数据库（防 Supabase 免费版被暂停），
+    并顺带自检向量服务与知识库检索，一眼看出 RAG 是否正常。
     被本机 ~/.hermes/scripts/oasis-keepalive.sh 与 GitHub Actions 定时访问。"""
+    out = {"status": "ok"}
     try:
         with engine.connect() as conn:
             conn.execute(_sql_text("SELECT 1"))
-            docs = conn.execute(_sql_text("SELECT COUNT(*) FROM documents")).scalar()
-            chunks = conn.execute(_sql_text("SELECT COUNT(*) FROM chunks")).scalar()
-        return {"status": "ok", "db": "ok", "documents": docs, "chunks": chunks}
+            out["documents"] = conn.execute(_sql_text("SELECT COUNT(*) FROM documents")).scalar()
+            out["chunks"] = conn.execute(_sql_text("SELECT COUNT(*) FROM chunks")).scalar()
+        out["db"] = "ok"
     except Exception as e:
-        raise HTTPException(503, f"数据库不可用: {str(e)[:120]}")
+        out["status"] = "degraded"
+        out["db"] = f"error: {str(e)[:80]}"
+    rag = {"enabled": bool(RAG_ENABLED), "top_k": RAG_TOP_K, "api_url": EMBED_API_URL}
+    try:
+        t0 = time.time()
+        _v = await embed_texts(["连通性自检"])
+        rag["embed_ok"] = bool(_v and len(_v[0]) > 0)
+        rag["embed_dim"] = len(_v[0]) if _v and _v[0] else 0
+        rag["embed_ms"] = int((time.time() - t0) * 1000)
+        _hits = await search_knowledge("耕地地力保护补贴")
+        rag["search_hits"] = len(_hits)
+        rag["top_similarity"] = _hits[0]["similarity"] if _hits else None
+    except Exception as e:
+        rag["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+    out["rag"] = rag
+    return out
 
 def resolve_uid(request: Request, response: Response, cookie_uid: Optional[str]) -> str:
     """统一身份解析：优先 token 账号，否则匿名 cookie。
@@ -1919,8 +1941,15 @@ SILICONFLOW_ASR_MODEL = os.environ.get("SILICONFLOW_ASR_MODEL", "FunAudioLLM/Sen
 # ========== RAG 向量化服务 ==========
 EMBED_API_URL = os.environ.get("EMBED_API_URL", "https://oasis-embed-4jsf.onrender.com")
 EMBED_DIM = 512
-RAG_ENABLED = os.environ.get("RAG_ENABLED", "1") == "1"
-RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
+# ★ 防错（2026-10-12）：环境变量写错（0/空/非数字）不能让 RAG 静默失效，更不能让启动崩
+RAG_ENABLED = str(os.environ.get("RAG_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+try:
+    RAG_TOP_K = int(os.environ.get("RAG_TOP_K") or 5)
+except Exception:
+    RAG_TOP_K = 5
+if RAG_TOP_K <= 0 or RAG_TOP_K > 50:
+    print(f"[警告] RAG_TOP_K 取值非法({os.environ.get('RAG_TOP_K')!r})，已回退默认 5")
+    RAG_TOP_K = 5
 # 管理员账号（唯一可更新知识库的账号）
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "guanliyuan")
 
