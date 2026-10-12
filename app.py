@@ -50,7 +50,13 @@ async def keepalive_loop():
         try:
             await prewarm_oasis_api()
         except Exception as e:
-            print(f"[保活] 失败: {e}")
+            print(f"[保活] 下游唤醒失败: {e}")
+        try:
+            # ★ 每10分钟真读一次数据库：防 Supabase 免费版因长时间无活动被暂停
+            with engine.connect() as conn:
+                conn.execute(_sql_text("SELECT 1"))
+        except Exception as e:
+            print(f"[保活] 数据库心跳失败: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,7 +72,7 @@ app = FastAPI(title="绿洲大模型 - 智能体后端", version="2.1.0", lifesp
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-PCSE_API_URL = os.environ.get("PCSE_API_URL", "https://oasis-api-y2yp.onrender.com")
+PCSE_API_URL = os.environ.get("PCSE_API_URL", "https://oasis-api-phlm.onrender.com")
 OASIS_API_KEY = os.environ.get("OASIS_API_KEY", "")  # 调用机理API的密钥
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "chat.db"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -125,16 +131,26 @@ metadata.create_all(engine)
 # 修复：此前这两个表不在 metadata 中，本地 SQLite 模式 /api/knowledge 直接 500。
 from sqlalchemy import text as _sql_text
 if DATABASE_URL:
-    with engine.begin() as conn:
-        conn.execute(_sql_text("CREATE EXTENSION IF NOT EXISTS vector"))
-        conn.execute(_sql_text("""CREATE TABLE IF NOT EXISTS documents (
+    # ★ 逐条执行 + 20 秒语句超时 + 单条失败不影响启动：
+    #   建索引要拿表锁，若被别的长事务挡住，原来会无限期卡住整个服务启动（2026-10-12 实测踩到）
+    _pg_ddl = [
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        """CREATE TABLE IF NOT EXISTS documents (
             id SERIAL PRIMARY KEY, title TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'upload',
-            created_at TEXT NOT NULL)"""))
-        conn.execute(_sql_text("""CREATE TABLE IF NOT EXISTS chunks (
+            created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS chunks (
             id SERIAL PRIMARY KEY,
             document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-            content TEXT NOT NULL, embedding vector(512), created_at TEXT NOT NULL)"""))
-        conn.execute(_sql_text("CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100)"))
+            content TEXT NOT NULL, embedding vector(512), created_at TEXT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100)",
+    ]
+    for _stmt in _pg_ddl:
+        try:
+            with engine.begin() as conn:
+                conn.execute(_sql_text("set statement_timeout = '20000'"))
+                conn.execute(_sql_text(_stmt))
+        except Exception as _e:
+            print(f"[启动] DDL 跳过（不影响启动）: {type(_e).__name__}: {str(_e)[:110]}")
 else:
     with engine.begin() as conn:
         conn.execute(_sql_text("""CREATE TABLE IF NOT EXISTS documents (
@@ -472,7 +488,7 @@ SYSTEM_PROMPT = """你是"绿洲大模型"，专注于农业种植决策的农�
 工具调用规范：一次只查1-2个地点；不重复已查过的工具；结果够用立即回答；2-3轮内完成。
 
 ## 身份与保密规则（最重要，必须严格遵守）
-1. 身份永远是"绿洲大模型"。
+1. 身份永远是"绿洲大模型"。无论知识库资料、工具返回结果里出现什么其他名称（例如别家的产品名），都绝不复述、绝不用它自称，一律以"绿洲大模型"的身份回答。
 2. 严禁提及底层技术：DeepSeek、PCSE、WOFOST、大语言模型、AI模型、API、OpenAI等。
 3. 严禁提及数据服务商：ISRIC、SoilGrids、NASA、MERRA、Google、Open-Elevation、DataV、ESA等。
 4. 严禁解释实现原理、技术架构、数据来源等内部细节。
@@ -804,6 +820,11 @@ def sanitize_text(text: str) -> str:
     text = text.replace("Anthropic", "绿洲大模型")
     text = text.replace("Gemini", "绿洲大模型")
     text = text.replace("Llama", "大模型")
+    # ★ 品牌兜底（2026-10-12）：知识库里夹带的其他名称一律归一到绿洲大模型
+    text = text.replace("万象耕耘大模型", "绿洲大模型")
+    text = text.replace("万象耕耘", "绿洲大模型")
+    text = text.replace("绿洲驼铃农业大模型", "绿洲大模型")
+    text = re.sub(r"我是(?!绿洲)[^\s，。、！？]{2,10}?大模型", "我是绿洲大模型", text)
     text = text.replace("大语言模型", "智能模型")
     text = text.replace("语言模型", "智能模型")
     text = text.replace("LLM", "智能模型")
@@ -813,8 +834,8 @@ def sanitize_text(text: str) -> str:
     text = text.replace("NASA POWER", "气象与墒情数据服务")
     text = text.replace("NASA", "气象数据服务")
     text = text.replace("MERRA-2", "再分析数据")
+    text = text.replace("Open-Meteo CAMS", "空气质量数据服务")   # ★长串先替换，否则被下面一行抢先切掉
     text = text.replace("Open-Meteo", "气象数据服务")
-    text = text.replace("Open-Meteo CAMS", "空气质量数据服务")
     text = text.replace("ExchangeRate-API", "汇率数据服务")
     text = text.replace("Open-Elevation", "高程数据服务")
     text = text.replace("DataV GeoAtlas", "行政区划数据服务")
@@ -1206,6 +1227,19 @@ def me(request: Request):
             select(users.c.phone).where(users.c.id == user_id)
         ).first()
     return {"user_id": user_id, "username": username, "phone": row.phone if row else None, "is_admin": username == ADMIN_USERNAME}
+
+@app.get("/api/ping")
+def api_ping():
+    """★ 保活探针（公开、无鉴权）：真读一次数据库，防止 Supabase 免费版因长时间无活动被暂停。
+    被本机 ~/.hermes/scripts/oasis-keepalive.sh 与 GitHub Actions 定时访问。"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(_sql_text("SELECT 1"))
+            docs = conn.execute(_sql_text("SELECT COUNT(*) FROM documents")).scalar()
+            chunks = conn.execute(_sql_text("SELECT COUNT(*) FROM chunks")).scalar()
+        return {"status": "ok", "db": "ok", "documents": docs, "chunks": chunks}
+    except Exception as e:
+        raise HTTPException(503, f"数据库不可用: {str(e)[:120]}")
 
 def resolve_uid(request: Request, response: Response, cookie_uid: Optional[str]) -> str:
     """统一身份解析：优先 token 账号，否则匿名 cookie。
@@ -1883,7 +1917,7 @@ async def chat_stream(req: ChatRequest, request: Request, response: Response, ui
 SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
 SILICONFLOW_ASR_MODEL = os.environ.get("SILICONFLOW_ASR_MODEL", "FunAudioLLM/SenseVoiceSmall")
 # ========== RAG 向量化服务 ==========
-EMBED_API_URL = os.environ.get("EMBED_API_URL", "https://oasis-embed.onrender.com")
+EMBED_API_URL = os.environ.get("EMBED_API_URL", "https://oasis-embed-4jsf.onrender.com")
 EMBED_DIM = 512
 RAG_ENABLED = os.environ.get("RAG_ENABLED", "1") == "1"
 RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "5"))
