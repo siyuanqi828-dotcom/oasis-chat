@@ -1,0 +1,51 @@
+name: oasis-keepalive
+
+# 绿洲大模型保活（电脑关机时也生效）
+#   · 每天：访问三个线上服务，并真读一次数据库 → 防止 Supabase 免费版因 7 天无活动被暂停
+#   · 每周：在网站界面自动注册一个账号（111、222、333…按周递增）→ 用户要求的第二道保险
+#
+# 注意：GitHub 对"60 天无提交"的仓库会停用定时工作流；若某天发现它停了，
+# 到仓库 Actions 页面点一下 "Enable workflow" 即可。本机开机时由
+# ~/.hermes/scripts/oasis-keepalive.sh（每 10 分钟）负责保活。
+
+on:
+  schedule:
+    - cron: "0 1 * * *"        # 每天 01:00 UTC ＝ 北京时间 09:00 —— 保活
+    - cron: "30 1 * * 1"       # 每周一 01:30 UTC ＝ 北京时间 09:30 —— 注册新账号
+  workflow_dispatch:            # 支持手动点一下立即运行（会同时跑两个任务）
+
+jobs:
+  keepalive:
+    name: 保活（三个服务 + 数据库心跳）
+    if: github.event.schedule == '0 1 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 网站（同时真读一次数据库）
+        run: curl -sS --max-time 120 https://oasis-chat-xcmc.onrender.com/api/ping || true
+      - name: 机理模型服务
+        run: curl -sS -o /dev/null -w "HTTP %{http_code}\n" --max-time 120 https://oasis-api-phlm.onrender.com/ || true
+      - name: 向量化服务
+        run: curl -sS -o /dev/null -w "HTTP %{http_code}\n" --max-time 120 https://oasis-embed-4jsf.onrender.com/ || true
+
+  weekly-register:
+    name: 每周注册一个账号（防暂停第二道保险）
+    if: github.event.schedule == '30 1 * * 1' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 按周递增注册（111、222、333…）
+        run: |
+          set -u
+          # 以 2026-10-12（本次部署日）为基准周，第一周=111，第二周=222，依次递增
+          BASE=$(date -u -d '2026-10-12' +%s)
+          WEEKS=$(( ( $(date -u +%s) - BASE ) / 604800 ))
+          IDX=$(( (WEEKS % 900) + 1 ))
+          NUM=$(( IDX * 111 ))
+          USER="$NUM"
+          PASS="$NUM$NUM"          # 密码需 ≥6 位，故写成 111111 / 222222 形式
+          echo "本次注册账号：$USER"
+          RESULT=$(curl -sS --max-time 120 -w "\n%{http_code}" \
+            -H "Content-Type: application/json" \
+            -X POST https://oasis-chat-xcmc.onrender.com/api/register \
+            -d "{\"username\":\"$USER\",\"password\":\"$PASS\"}" || true)
+          echo "$RESULT"
+          echo "（若返回 400 用户名已存在＝本周期已注册过，属正常，不视为失败）"
